@@ -1,0 +1,290 @@
+#include <Wire.h>
+#include <WiFi.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <HTTPClient.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include "AudioTools.h"
+#include "AudioLibs/A2DPStream.h"
+
+// I2C Configuration
+#define I2C_SDA 15
+#define I2C_SCL 14
+TwoWire I2Cbus = TwoWire(0);  // Use specific instance for I2C
+
+// OLED Configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &I2Cbus, OLED_RESET);
+
+// Button Configuration
+const int buttonPrev = 12;
+const int buttonNext = 13;
+const int buttonSelect = 2;
+
+// Bluetooth and Audio Configuration
+BLEScan* pBLEScan;
+A2DPStream a2dpStream;
+
+// WiFi Configuration
+String ssidList[10];
+int ssidCount = 0;
+int selectedSSIDIndex = 0;
+String selectedSSID = "";
+String wifiPassword = "";
+bool wifiConnected = false;
+
+// Radio Stations (URLs of Swedish streams)
+String radioStations[] = {
+  "https://fm01-ice.stream.khz.se/fm01_mp3",
+  "https://fm05-ice.stream.khz.se/fm05_mp3",
+  "https://wr13-ice.stream.khz.se/wr13_mp3",
+  "https://wr15-ice.stream.khz.se/wr15_mp3",
+  "https://wr09-ice.stream.khz.se/wr09_mp3"
+};
+int currentStation = 0;
+bool isPlaying = false;
+
+// Menus
+enum MenuState { MAIN_MENU, WIFI_MENU, BLUETOOTH_MENU, RADIO_MENU, PASSWORD_ENTRY };
+MenuState currentMenu = MAIN_MENU;
+int mainMenuIndex = 0;
+String mainMenuOptions[] = { "WiFi", "Bluetooth", "Play Radio" };
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize I2C
+  I2Cbus.begin(I2C_SDA, I2C_SCL, 100000);
+
+  // Configure OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.printf("SSD1306 OLED display failed to initialize.\n");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.display();
+
+  // Configure Buttons
+  pinMode(buttonPrev, INPUT_PULLDOWN);
+  pinMode(buttonNext, INPUT_PULLDOWN);
+  pinMode(buttonSelect, INPUT_PULLDOWN);
+
+  // Configure BLE
+  BLEDevice::init("ESP32_BLE_Scanner");
+  pBLEScan = BLEDevice::getScan();
+  pBLEScan->setActiveScan(true);
+  pBLEScan->setInterval(100);
+  pBLEScan->setWindow(99);
+
+  // Display Main Menu
+  displayMainMenu();
+}
+
+void loop() {
+  switch (currentMenu) {
+    case MAIN_MENU:
+      handleMainMenu();
+      break;
+    case WIFI_MENU:
+      handleWiFiMenu();
+      break;
+    case BLUETOOTH_MENU:
+      handleBluetoothMenu();
+      break;
+    case RADIO_MENU:
+      if (isPlaying) {
+        transmitAudio(radioStations[currentStation]);
+      }
+      break;
+    case PASSWORD_ENTRY:
+      handlePasswordEntry();
+      break;
+  }
+}
+
+void displayMainMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("Main Menu:");
+  display.println(mainMenuOptions[mainMenuIndex]);
+  display.display();
+}
+
+void handleMainMenu() {
+  if (digitalRead(buttonPrev) == HIGH) {
+    mainMenuIndex--;
+    if (mainMenuIndex < 0) {
+      mainMenuIndex = sizeof(mainMenuOptions) / sizeof(mainMenuOptions[0]) - 1;
+    }
+    displayMainMenu();
+    delay(200); // Debounce
+  }
+
+  if (digitalRead(buttonNext) == HIGH) {
+    mainMenuIndex++;
+    if (mainMenuIndex >= sizeof(mainMenuOptions) / sizeof(mainMenuOptions[0])) {
+      mainMenuIndex = 0;
+    }
+    displayMainMenu();
+    delay(200); // Debounce
+  }
+
+  if (digitalRead(buttonSelect) == HIGH) {
+    switch (mainMenuIndex) {
+      case 0:
+        currentMenu = WIFI_MENU;
+        scanWiFiNetworks();
+        displayWiFiNetworks();
+        break;
+      case 1:
+        currentMenu = BLUETOOTH_MENU;
+        handleBluetoothMenu();
+        break;
+      case 2:
+        currentMenu = RADIO_MENU;
+        displayStationInfo();
+        break;
+    }
+    delay(200); // Debounce
+  }
+}
+
+void handleWiFiMenu() {
+  handleWiFiSelection();
+}
+
+void scanWiFiNetworks() {
+  int n = WiFi.scanNetworks();
+  ssidCount = (n < sizeof(ssidList) / sizeof(ssidList[0])) ? n : sizeof(ssidList) / sizeof(ssidList[0]);
+  
+  for (int i = 0; i < ssidCount; i++) {
+    ssidList[i] = WiFi.SSID(i);
+  }
+}
+
+void displayWiFiNetworks() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("Select WiFi:");
+  display.println(ssidList[selectedSSIDIndex]);
+  display.display();
+}
+
+void handleWiFiSelection() {
+  if (digitalRead(buttonPrev) == HIGH) {
+    selectedSSIDIndex--;
+    if (selectedSSIDIndex < 0) {
+      selectedSSIDIndex = ssidCount - 1;
+    }
+    displayWiFiNetworks();
+    delay(200); // Debounce
+  }
+
+  if (digitalRead(buttonNext) == HIGH) {
+    selectedSSIDIndex++;
+    if (selectedSSIDIndex >= ssidCount) {
+      selectedSSIDIndex = 0;
+    }
+    displayWiFiNetworks();
+    delay(200); // Debounce
+  }
+
+  if (digitalRead(buttonSelect) == HIGH) {
+    selectedSSID = ssidList[selectedSSIDIndex];
+    currentMenu = PASSWORD_ENTRY;
+    displayPasswordEntry();
+    delay(200); // Debounce
+  }
+}
+
+void displayPasswordEntry() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("Enter Password:");
+  display.display();
+}
+
+void handlePasswordEntry() {
+  if (digitalRead(buttonSelect) == HIGH) {
+    WiFi.begin(selectedSSID.c_str(), wifiPassword.c_str());
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      attempts++;
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Connected to WiFi");
+      wifiConnected = true;
+      currentMenu = MAIN_MENU;
+      displayMainMenu();
+    } else {
+      Serial.println("Failed to connect to WiFi");
+    }
+    delay(200); // Debounce
+  }
+}
+
+void transmitAudio(String url) {
+  HTTPClient http;
+  http.begin(url);
+  
+  int httpCode = http.GET();
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK) {
+      WiFiClient* stream = http.getStreamPtr();
+      
+      // Configure and start A2DP stream
+      auto cfgA2DP = a2dpStream.defaultConfig(TX_MODE);
+      cfgA2DP.name = "ESP32-A2DP";
+      a2dpStream.begin(cfgA2DP);
+      
+      // Stream audio via Bluetooth
+      StreamCopy copier(a2dpStream, *stream);
+      while (http.connected()) {
+        copier.copy();
+      }
+    }
+  }
+  http.end();
+}
+
+void handleBluetoothMenu() {
+  Serial.println("Scanning for Bluetooth devices...");
+  
+  // Start scanning
+  pBLEScan->start(5, scanCompleteCallback);
+  
+  delay(10000);  // Delay to avoid continuous scanning
+}
+
+void scanCompleteCallback(BLEScanResults scanResults) {
+  Serial.println("Scan complete!");
+  int count = scanResults.getCount();
+  Serial.printf("Devices found: %d\n", count);
+  for (int i = 0; i < count; i++) {
+    BLEAdvertisedDevice device = scanResults.getDevice(i);
+    Serial.printf("Device found: %s\n", device.toString().c_str());
+  }
+}
+
+void displayStationInfo() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.print("Playing: ");
+  display.println(radioStations[currentStation]);
+  display.display();
+}
